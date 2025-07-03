@@ -14,13 +14,13 @@ from openpyxl import Workbook
 logging.basicConfig(format='%(asctime)s : %(message)s', level=logging.DEBUG)
 
 # Set PATHs
-PATH_TO_SENTEVAL = 'SentEval'
-PATH_TO_DATA = 'SentEval/data'
+PATH_TO_SENTEVAL = './SentEval'
+PATH_TO_DATA = './SentEval/data'
 workbook = Workbook()
 
 # Import SentEval
 sys.path.insert(0, PATH_TO_SENTEVAL)
-import SentEval.senteval as senteval
+import senteval
 
 def print_table(task_names, scores):
     tb = PrettyTable()
