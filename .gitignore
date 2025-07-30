@@ -4,8 +4,7 @@ __pycache__/
 *$py.class
 
 # submodules
-\apex
-\SentEval
+/apex/
 
 # C extensions
 *.so
