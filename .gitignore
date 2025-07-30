@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# submodules
+\apex
+\SentEval
+
 # C extensions
 *.so
 
