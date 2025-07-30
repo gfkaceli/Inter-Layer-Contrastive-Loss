@@ -255,3 +255,71 @@ class OurTrainingArguments(TrainingArguments):
 
         return device
 
+def main():
+
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, OurTrainingArguments))
+
+    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+        # If we pass only one argument to the script and it's the path to a json file,
+        # let's parse it to get our arguments.
+        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+    else:
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    if (
+            os.path.exists(training_args.output_dir)
+            and os.listdir(training_args.output_dir)
+            and training_args.do_train
+            and not training_args.overwrite_output_dir
+    ):
+        raise ValueError(
+            f"Output directory ({training_args.output_dir}) already exists and is not empty."
+            "Use --overwrite_output_dir to overcome."
+        )
+
+        # Setup logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO if is_main_process(training_args.local_rank) else logging.WARN,
+    )
+
+    # Log on each process the small summary:
+    logger.warning(
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
+        + f" distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+    )
+    # Set the verbosity to info of the Transformers logger (on main process only):
+    if is_main_process(training_args.local_rank):
+        transformers.utils.logging.set_verbosity_info()
+        transformers.utils.logging.enable_default_handler()
+        transformers.utils.logging.enable_explicit_format()
+    logger.info("Training/evaluation parameters %s", training_args)
+
+    # Set seed before initializing model.
+    set_seed(training_args.seed)
+
+    # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
+    # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
+    # (the dataset will be downloaded automatically from the datasets Hub
+    #
+    # For CSV/JSON files, this script will use the column called 'text' or the first column. You can easily tweak this
+    # behavior (see below)
+    #
+    # In distributed training, the load_dataset function guarantee that only one local process can concurrently
+    # download the dataset.
+    data_files = {}
+    if data_args.train_file is not None:
+        data_files["train"] = data_args.train_file
+    extension = data_args.train_file.split(".")[-1]
+    if extension == "txt":
+        extension = "text"
+    if extension == "csv":
+        datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/",
+                                delimiter="\t" if "tsv" in data_args.train_file else ",")
+    else:
+        datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/")
+    return None
+
+if __name__ == "__main__":
+    main()

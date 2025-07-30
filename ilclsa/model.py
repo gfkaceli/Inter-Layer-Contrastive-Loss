@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -261,7 +262,64 @@ def cl_forward(cls,
     return_dict=None,
     mlm_input_ids=None,
     mlm_labels=None,):
-    pass
+    return_dict = return_dict if return_dict is not None else cls.config.use_return_dict
+    ori_input_ids = input_ids
+    batch_size = input_ids.size(0)
+
+    num_sent = input_ids.size(1)
+
+    mlm_outputs = None
+
+    # flatten input for encoding
+    input_ids = input_ids.view((-1, input_ids.size(-1)))
+
+    attention_mask = attention_mask.view((-1, attention_mask.size(-1)))
+    if token_type_ids is not None:
+        token_type_ids = token_type_ids.view((-1, token_type_ids.size(-1)))
+
+    # get raw embeddings
+    outputs = encoder(
+        input_ids,
+        attention_mask,
+        token_type_ids=token_type_ids,
+        position_ids=position_ids,
+        head_mask=head_mask,
+        inputs_embeds=inputs_embeds,
+        output_attentions=output_attentions,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+
+    # MLM auxiliary objectives
+    if mlm_input_ids is not None:
+        mlm_input_ids = mlm_input_ids.view((-1, mlm_input_ids.size(-1)))
+        mlm_outputs = encoder(
+            mlm_input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        # Pooling
+    pooler_output, hidden_states = cls.pooler(attention_mask, outputs)
+    pooler_output = pooler_output.view((batch_size, num_sent, pooler_output.size(-1)))  # (bs, num_sent, hidden)
+
+    # optional MLP on cls
+    if cls.pooler_type == "cls":
+        pooler_output = cls.mlp(pooler_output)
+
+        # split z1, z2 (and z3 if present)
+    z1 = pooler_output[:, 0]
+    z2 = pooler_output[:, 1]
+    if num_sent == 3:
+        z3 = pooler_output[:, 2]
+
+    return SequenceClassifierOutput()
 
 def sentemb_forward( cls,
     encoder,
@@ -275,7 +333,35 @@ def sentemb_forward( cls,
     output_attentions=None,
     output_hidden_states=None,
     return_dict=None,):
-    pass
+
+    return_dict = return_dict if return_dict is not None else cls.config.use_return_dict
+
+    outputs = encoder(
+        input_ids,
+        attention_mask=attention_mask,
+        token_type_ids=token_type_ids,
+        position_ids=position_ids,
+        head_mask=head_mask,
+        inputs_embeds=inputs_embeds,
+        output_attentions=output_attentions,
+        output_hidden_states=True if cls.pooler_type in ['avg_top2', 'avg_first_last'] else False,
+        return_dict=True,
+    )
+
+    pooler_output = cls.pooler(attention_mask, outputs)
+    #     print(pooler_output.shape)
+    if cls.pooler_type == "cls" and not cls.model_args.mlp_only_train:
+        pooler_output = cls.mlp(pooler_output)
+
+    if not return_dict:
+        return (outputs[0], pooler_output) + outputs[2:]
+
+    return BaseModelOutputWithPoolingAndCrossAttentions(
+        pooler_output=pooler_output,
+        last_hidden_state=outputs.last_hidden_state,
+        hidden_states=outputs.hidden_states,
+    )
+
 
 class BertForCL(BertPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"position_ids"]
