@@ -319,7 +319,7 @@ def main():
                                 delimiter="\t" if "tsv" in data_args.train_file else ",")
     else:
         datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/")
-    return None
+        #return None
 
     # Load pretrained model and tokenizer
     #

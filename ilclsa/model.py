@@ -241,7 +241,12 @@ def cl_init(cls, config):
     cls.iso_weight = getattr(cls.model_args, "iso_weight", 0.01)
     cls.top_k_layers = getattr(cls.model_args, "top_k_layers", 3)
     cls.layer_selector = getattr(cls.model_args, "layer_selector", "topk")
-    cls.num_layers = len(config.num_hidden_layers) if hasattr(config, "num_hidden_layers") else config.num_hidden_layers
+    if hasattr(config, "num_hidden_layers"):
+        cls.num_layers = config.num_hidden_layers
+    elif hasattr(config, "num_layers"):
+        cls.num_layers = config.num_layers
+    else:
+        raise ValueError("Cannot determine number of hidden layers from config")
     # gating MLP over layers
     cls.layer_gate = LayerGate(config.hidden_size, cls.num_layers)
     # supervision on which layer-pairs to pull
