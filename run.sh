@@ -6,8 +6,8 @@ export CUDA_VISIBLE_DEVICES=0
 python train.py \
   --train_file data/wiki1m_for_simcse.txt \
   --model_name_or_path bert-base-uncased \
-  --num_train_epochs 2 \
-  --per_device_train_batch_size 8 \
+  --num_train_epochs 1 \
+  --per_device_train_batch_size 64 \
   --learning_rate 3e-5 \
   --max_seq_length 32 \
   --pooler_type avg \
