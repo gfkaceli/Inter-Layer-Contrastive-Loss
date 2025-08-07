@@ -8,6 +8,7 @@ import torch
 import collections
 import random
 
+from accelerate.state import PartialState
 from datasets import load_dataset
 
 import transformers
@@ -207,10 +208,15 @@ class OurTrainingArguments(TrainingArguments):
     ## By default, we evaluate STS (dev) during training (for selecting best checkpoints) and evaluate
     ## both STS and transfer tasks (dev) at the end of training. Using --eval_transfer will allow evaluating
     ## both STS and transfer tasks (dev) during training.
+    distributed_state: Optional[PartialState] = field(init=False, default=None)
     eval_transfer: bool = field(
         default=False,
         metadata={"help": "Evaluate transfer task dev sets (in validation)."}
     )
+
+    def __post_init__(self):
+      # ensure TrainingArguments sets up its internals (distributed_state, etc.)
+      super().__post_init__()
 
     @cached_property
     def _setup_devices(self) -> "torch.device":
@@ -237,6 +243,7 @@ class OurTrainingArguments(TrainingArguments):
             # deepspeed  ./program.py
             # rather than:
             # python -m torch.distributed.launch --nproc_per_node=2 ./program.py
+
             if self.deepspeed:
                 from transformers.integrations import is_deepspeed_available
 

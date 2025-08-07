@@ -17,10 +17,11 @@ python train.py \
   --do_train \
   --logging_steps 10 \
   --logging_strategy steps \
-  --eval_strategy steps \
+  --eval_strategy no \
   --eval_steps 100 \
   --save_strategy steps \
   --save_steps 100 \
   --output_dir result \
   --overwrite_output_dir \
+  --fp16 \
   --use_cpu

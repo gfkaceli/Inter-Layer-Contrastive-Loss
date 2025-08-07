@@ -291,6 +291,8 @@ class CLTrainer(Trainer):
         # Data loader and number of training steps
         train_dataloader = self.get_train_dataloader()
 
+        self.sharded_dpp = False
+
         # Setting up training control variables:
         # number of training epochs: num_train_epochs
         # number of training steps per epoch: num_update_steps_per_epoch
@@ -353,7 +355,6 @@ class CLTrainer(Trainer):
                 ),
             )
             # find_unused_parameters breaks checkpointing as per
-            # https://github.com/huggingface/transformers/pull/4659#issuecomment-643356021
 
         # for the rest of this function `model` is the outside model, whether it was wrapped or not
         if model is not self.model:
@@ -454,6 +455,8 @@ class CLTrainer(Trainer):
             self.control = self.callback_handler.on_epoch_begin(self.args, self.state, self.control)
 
             assert train_dataset_is_sized, "currently we only support sized dataloader!"
+            train_start_time = getattr(self, "_training_start_time", None) or time.time()
+            ignore_keys = self.args.ignore_keys_for_eval if hasattr(self.args, "ignore_keys_for_eval") else None
 
             inputs = None
             last_inputs = None
@@ -483,9 +486,9 @@ class CLTrainer(Trainer):
                     if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0 and not self.deepspeed:
                         # deepspeed does its own clipping
 
-                        if self.use_amp:
+                        #if self.use_amp:
                             # AMP: gradients need unscaling
-                            self.scaler.unscale_(self.optimizer)
+                            #self.scaler.unscale_(self.optimizer)
 
                         if hasattr(self.optimizer, "clip_grad_norm"):
                             # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
@@ -500,9 +503,9 @@ class CLTrainer(Trainer):
                     # Optimizer step
                     if is_torch_xla_available():
                         xm.optimizer_step(self.optimizer)
-                    elif self.use_amp:
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
+                    #elif self.use_amp:
+                        #self.scaler.step(self.optimizer)
+                        #self.scaler.update()
                     else:
                         self.optimizer.step()
 
@@ -514,13 +517,15 @@ class CLTrainer(Trainer):
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
 
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch)
+                    self._maybe_log_save_evaluate(self, tr_loss, model, trial, epoch,
+                                                  ignore_keys, train_start_time)
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
 
             self.control = self.callback_handler.on_epoch_end(self.args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, model, trial, epoch)
+            self._maybe_log_save_evaluate(self, tr_loss, model, trial, epoch,
+                                                  ignore_keys, train_start_time)
 
             if self.args.tpu_metrics_debug or self.args.debug:
                 if is_torch_xla_available():
