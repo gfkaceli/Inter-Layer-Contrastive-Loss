@@ -457,6 +457,7 @@ class CLTrainer(Trainer):
             assert train_dataset_is_sized, "currently we only support sized dataloader!"
             train_start_time = getattr(self, "_training_start_time", None) or time.time()
             ignore_keys = self.args.ignore_keys_for_eval if hasattr(self.args, "ignore_keys_for_eval") else None
+            grad_norm = None
 
             inputs = None
             last_inputs = None
@@ -517,15 +518,16 @@ class CLTrainer(Trainer):
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
 
-                    self._maybe_log_save_evaluate(self, tr_loss, model, trial, epoch,
-                                                  ignore_keys, train_start_time)
+                    self._maybe_log_save_evaluate(tr_loss,grad_norm, model, trial, epoch,
+                                                  ignore_keys, start_time=train_start_time)
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
 
             self.control = self.callback_handler.on_epoch_end(self.args, self.state, self.control)
-            self._maybe_log_save_evaluate(self, tr_loss, model, trial, epoch,
-                                                  ignore_keys, train_start_time)
+            self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch,
+                                                ignore_keys,
+                                          train_start_time)
 
             if self.args.tpu_metrics_debug or self.args.debug:
                 if is_torch_xla_available():
