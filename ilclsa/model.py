@@ -1,13 +1,10 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
 import transformers
-from openpyxl.styles.builtins import output
 from torch.nn import MSELoss
-from transformers import RobertaTokenizer
 from transformers.models.roberta.modeling_roberta import RobertaPreTrainedModel, RobertaModel, RobertaLMHead
 from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertModel, BertLMPredictionHead
 from transformers.activations import gelu
@@ -28,47 +25,27 @@ class LayerGate(nn.Module):
 
     def forward(self, layer_feats):
         # layer_feats: [batch, num_layers, hidden_size]
-        # we average over tokens already, so just pool across layers
-        # → logits of shape [batch, num_layers]
+        # we average over tokens already, so just pool across layers -> logits of shape [batch, num_layers]
         return self.fc(layer_feats.mean(dim=-1))
 
 class MLPLayer(nn.Module):
-    """
-     Head for getting sentence representations over RoBERTa/BERT's CLS representation.
-     """
-
+    """Head for getting sentence representations from CLS representation."""
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        #         self.scale = nn.Linear(config.hidden_size, 256)
-        #         self.dropout = nn.Dropout(0.3)
         self.activation = nn.Tanh()
-
-    def forward(self, features, **kwargs):
+    def forward(self, features):
         x = self.dense(features)
-        #         x = self.scale(features)
-        #         x = self.dropout(x)
         x = self.activation(x)
-
         return x
 
 class DropoutLayer(nn.Module):
-    """
-    Head for dropout getting sentence representations over RoBERTa/BERT's CLS representation.
-    """
-
+    """Dropout layer for sentence representations."""
     def __init__(self, config):
         super().__init__()
         self.dropout = nn.Dropout(0.2)
-
-    #         self.activation = nn.Tanh()
-
-    def forward(self, features, **kwargs):
-        x = self.dropout(features)
-        #         x = self.activation(x)
-
-        return x
-
+    def forward(self, features):
+        return self.dropout(features)
 
 class ProjectionMLP(nn.Module):
     def __init__(self, config):
@@ -76,153 +53,88 @@ class ProjectionMLP(nn.Module):
         in_dim = config.hidden_size
         hidden_dim = config.hidden_size * 2
         out_dim = config.hidden_size
-        affine=False
-        list_layers = [nn.Linear(in_dim, hidden_dim, bias=False),
-                       nn.BatchNorm1d(hidden_dim),
-                       nn.ReLU(inplace=True)]
-        list_layers += [nn.Linear(hidden_dim, out_dim, bias=False),
-                        nn.BatchNorm1d(out_dim, affine=affine),nn.Tanh()]
-        self.net = nn.Sequential(*list_layers)
-
+        affine = False
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim, bias=False),
+            nn.BatchNorm1d(out_dim, affine=affine),
+            nn.Tanh(),
+        )
     def forward(self, x):
         return self.net(x)
 
 class Similarity(nn.Module):
-    """
-    Dot product or cosine similarity
-    """
-
+    """Dot product or cosine similarity with temperature scaling."""
     def __init__(self, temp):
         super().__init__()
         self.temp = temp
         self.cos = nn.CosineSimilarity(dim=-1)
-
     def forward(self, x, y):
         return self.cos(x, y) / self.temp
 
 class Pooler(nn.Module):
     """
-       Parameter-free poolers to get the sentence embedding
-       'cls': [CLS] representation with BERT/RoBERTa's MLP pooler.
-       'cls_before_pooler': [CLS] representation without the original MLP pooler.
-       'avg': average of the last layers' hidden states at each token.
-       'avg_top2': average of the last two layers.
-       'avg_first_last': average of the first and the last layers.
-       """
-
+    Parameter-free pooler to get the sentence embedding from token embeddings.
+    Supported types:
+      - 'cls': use [CLS] token (after transformer encoder)
+      - 'cls_before_pooler': [CLS] token without the encoder’s built-in pooler
+      - 'avg': average of last layer token embeddings (masked average)
+      - 'avg_top2': average of the last two layers’ token embeddings
+      - 'avg_first_last': average of the first and last layers’ token embeddings
+    """
     def __init__(self, pooler_type):
         super().__init__()
+        assert pooler_type in ["cls", "cls_before_pooler", "avg", "avg_top2", "avg_first_last"], f"unrecognized pooling type {pooler_type}"
         self.pooler_type = pooler_type
-        assert self.pooler_type in ["cls", "cls_before_pooler", "avg", "avg_top2",
-                                    "avg_first_last"], "unrecognized pooling type %s" % self.pooler_type
 
     def forward(self, attention_mask, outputs):
-        last_hidden = outputs.last_hidden_state
-        pooler_output = outputs.pooler_output
-        #         if pooler_output:
-        #             print(pooler_output.size(),'----')
-        hidden_states = outputs.hidden_states if outputs.hidden_states else last_hidden
-
+        last_hidden = outputs.last_hidden_state      # [bs*num_sent, seq_len, hid]
+        hidden_states = outputs.hidden_states if outputs.hidden_states is not None else last_hidden
+        # Always return a tuple: (pooled_output, hidden_states)
         if self.pooler_type in ['cls_before_pooler', 'cls']:
-            return last_hidden[:, 0], hidden_states
+            pooled = last_hidden[:, 0]  # CLS token
+            return pooled, hidden_states
         elif self.pooler_type == "avg":
-            return (last_hidden * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(
-                -1), hidden_states
+            pooled = (last_hidden * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
+            return pooled, hidden_states
         elif self.pooler_type == "avg_first_last":
+            # average of first and last layer hidden states
             first_hidden = hidden_states[0]
             last_hidden = hidden_states[-1]
-            pooled_result = ((first_hidden + last_hidden) / 2.0 * attention_mask.unsqueeze(-1)).sum(
-                1) / attention_mask.sum(-1).unsqueeze(-1)
-            return pooled_result
+            pooled = ((first_hidden + last_hidden) / 2.0 * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
+            return pooled, hidden_states
         elif self.pooler_type == "avg_top2":
+            # average of last two layers
             second_last_hidden = hidden_states[-2]
             last_hidden = hidden_states[-1]
-            pooled_result = ((last_hidden + second_last_hidden) / 2.0 * attention_mask.unsqueeze(-1)).sum(
-                1) / attention_mask.sum(-1).unsqueeze(-1)
-            return pooled_result
+            pooled = ((last_hidden + second_last_hidden) / 2.0 * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
+            return pooled, hidden_states
         else:
             raise NotImplementedError
 
-
 def construct_negative(cls, batch_size, attention_mask, z1, cos_sim, loss_fct, hidden_states, num_sent, labels):
+    # Use hidden representations from specified negative layers as additional negatives (SSCL)
     for i in range(cls.negative_layers):
-        outputs = hidden_states[-2-i]
+        outputs = hidden_states[-2 - i]  # take last i+1-th layer (excluding final)
         if cls.pooler_type == 'cls':
             pooler_outputs = outputs[:, 0]
         elif cls.pooler_type == 'avg':
-            pooler_outputs = ((outputs * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1))
-
+            pooler_outputs = (outputs * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
+        else:
+            # default to cls for other types
+            pooler_outputs = outputs[:, 0]
         pooler_outputs = pooler_outputs.view((batch_size, num_sent, outputs.size(-1)))
-
         if cls.pooler_type == "cls":
-            pooler_outputs =cls.mlp(pooler_outputs)
-
+            pooler_outputs = cls.mlp(pooler_outputs)
         # separate representations
         n1, n2 = pooler_outputs[:, 0], pooler_outputs[:, 1]
-
         cos_sim1 = cls.sim(z1.unsqueeze(1), n1.unsqueeze(0))
         cos_sim2 = cls.sim(z1.unsqueeze(1), n2.unsqueeze(0))
-        cos_sim = torch.cat((cos_sim, cos_sim1), dim=-1)
-        cos_sim = torch.cat((cos_sim, cos_sim2), dim=-1)
+        cos_sim = torch.cat([cos_sim, cos_sim1, cos_sim2], dim=-1)
     loss = loss_fct(cos_sim, labels)
     return loss
-
-
-
-def construct_negative_layers(cls, batch_size, attention_mask, z1,
-                              cos_sim, loss_fct, hidden_states, num_sent, labels):
-    outputs = hidden_states[cls.negative_layers]
-
-    if cls.pooler_type == 'cls':
-        pooler_outputs = hidden_states[:, 0]
-
-    elif cls.pooler_type == 'avg':
-        pooler_ouputs = ((outputs * attention_mask.unsqueeze.sum(1)) / attention_mask.unsqueeze.sum(1))
-
-    pooler_outputs = pooler_outputs.view((batch_size, num_sent, outputs.size(-1)))  # (bs, num_sent, hidden)
-
-    if cls.pooler_type == "cls":
-        pooler_outputs = cls.mlp(pooler_outputs)
-    #         pooler_outputs = cls.proj_mlp(pooler_outputs)
-    # Separate representation
-    n1, n2 = pooler_ouputs[:, 0], pooler_outputs[:, 1]
-    ## to do get batch embeddings and calculate loss
-
-    if num_sent == 3:
-        z3 = pooler_outputs[:, 2]
-
-    if dist.is_initialized() and cls.training:
-        # gather hard negatives
-        if num_sent >= 3:
-            z3_list = [torch.zeros_like(z3) for _ in range(dist.get_world_size())]
-            dist.all_gather(tensor_list=z3_list, tensor=z3.contiguous())
-            z3_list[dist.get_rank()] = z3
-            z3 = torch.cat(z3_list, 0)
-
-        # dummy vectors
-        n1_list = [torch.zeros_like(n1) for _ in range(dist.get_world_size())]
-        n2_list = [torch.zeros_like(n2) for _ in range(dist.get_world_size())]
-        # Allgather
-        dist.all_gather(tensor_list=n1_list, tensor=n1.contiguous())
-        dist.all_gather(tensor_list=n2_list, tensor=n2.contiguous())
-
-        # Since allgather results do not have gradients, we replace the
-        # current process's corresponding embeddings with original tensors
-        n1_list[dist.get_rank()] = n1
-        n2_list[dist.get_rank()] = n2
-        # Get full batch embeddings: (bs x N, hidden)
-        n1 = torch.cat(n1_list, 0)
-        n2 = torch.cat(n2_list, 0)
-    cos_sim1 =  cls.sim(z1.unsqueeze(1), n1.unsqueeze(0))
-    cos_sim2 =  cls.sim(z1.unsqueeze(1), n2.unsqueeze(0))
-    cos_sim = torch.cat((cos_sim, cos_sim1), dim=-1)
-    cos_sim = torch.cat((cos_sim, cos_sim2), dim=-1)
-    if num_sent==3 :
-        z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))
-        cos_sim = torch.cat([cos_sim, z1_z3_cos], 1)
-    loss = loss_fct(cos_sim, labels)
-    return loss
-
 
 def cl_init(cls, config):
     cls.pooler_type = cls.model_args.pooler_type
@@ -235,23 +147,39 @@ def cl_init(cls, config):
         cls.proj_mlp = ProjectionMLP(config)
     cls.sim = Similarity(temp=cls.model_args.temp)
     cls.init_weights()
-    # new for ILCL-SA
+    # New arguments for ILCL-SA
+    cls.ilcl_sa = getattr(cls.model_args, "ilcl_sa", False)
+    cls.ilcl_layers = getattr(cls.model_args, "ilcl_layers", [])
+    cls.ilcl_weight = getattr(cls.model_args, "ilcl_weight", 1.0)
+    cls.normalize_emb = getattr(cls.model_args, "normalize_emb", False)
+    # For backward compatibility or default selection: if ILCL-SA enabled but no layers specified, use top_k_layers if available
+    cls.top_k_layers = getattr(cls.model_args, "top_k_layers", 3)
+    if cls.ilcl_sa and len(cls.ilcl_layers) == 0:
+        # default to last `top_k_layers` intermediate layers
+        if hasattr(config, "num_hidden_layers"):
+            total_layers = config.num_hidden_layers
+        elif hasattr(config, "num_layers"):
+            total_layers = config.num_layers
+        else:
+            total_layers = None
+        if total_layers:
+            # select the last `top_k_layers` indices (excluding final layer)
+            cls.ilcl_layers = [total_layers - i - 2 for i in range(cls.top_k_layers)]
+            # ensure indices are valid and sorted
+            cls.ilcl_layers = sorted([idx for idx in cls.ilcl_layers if idx >= 0])
+    # (Optional anchor/momentum fields for future)
     cls.use_anchor = getattr(cls.model_args, "use_anchor", False)
     cls.anchor_weight = getattr(cls.model_args, "anchor_weight", 0.2)
     cls.iso_weight = getattr(cls.model_args, "iso_weight", 0.01)
-    cls.top_k_layers = getattr(cls.model_args, "top_k_layers", 3)
-    cls.layer_selector = getattr(cls.model_args, "layer_selector", "topk")
+    # Prepare layer gating (not used in current implementation but reserved)
     if hasattr(config, "num_hidden_layers"):
         cls.num_layers = config.num_hidden_layers
     elif hasattr(config, "num_layers"):
         cls.num_layers = config.num_layers
     else:
-        raise ValueError("Cannot determine number of hidden layers from config")
-    # gating MLP over layers
-    cls.layer_gate = LayerGate(config.hidden_size, cls.num_layers)
-    # supervision on which layer-pairs to pull
+        cls.num_layers = None
+    cls.layer_gate = LayerGate(config.hidden_size, cls.num_layers) if cls.num_layers else None
     cls.anchor_loss_fn = MSELoss()
-
 
 def cl_forward(cls,
     encoder,
@@ -266,22 +194,16 @@ def cl_forward(cls,
     output_hidden_states=None,
     return_dict=None,
     mlm_input_ids=None,
-    mlm_labels=None,):
+    mlm_labels=None):
     return_dict = return_dict if return_dict is not None else cls.config.use_return_dict
-    ori_input_ids = input_ids
     batch_size = input_ids.size(0)
-    # Number of sentences in one instance
-    # 2: pair instance; 3: pair instance with a hard negative
-    num_sent = input_ids.size(1)
-
-    mlm_outputs = None
+    num_sent = input_ids.size(1)  # 2 for pair (SimCSE), 3 if an extra hard negative
     # Flatten input for encoding
-    input_ids = input_ids.view((-1, input_ids.size(-1)))  # (bs * num_sent, len)
-    attention_mask = attention_mask.view((-1, attention_mask.size(-1)))  # (bs * num_sent len)
+    input_ids = input_ids.view(-1, input_ids.size(-1))             # [bs * num_sent, seq_len]
+    attention_mask = attention_mask.view(-1, attention_mask.size(-1))
     if token_type_ids is not None:
-        token_type_ids = token_type_ids.view((-1, token_type_ids.size(-1)))  # (bs * num_sent, len)
-
-    # Get raw embeddings
+        token_type_ids = token_type_ids.view(-1, token_type_ids.size(-1))
+    # Encode all sentences (and optional MLM augmentation)
     outputs = encoder(
         input_ids,
         attention_mask=attention_mask,
@@ -290,13 +212,12 @@ def cl_forward(cls,
         head_mask=head_mask,
         inputs_embeds=inputs_embeds,
         output_attentions=output_attentions,
-        output_hidden_states=True,
+        output_hidden_states=True,  # always get hidden states for ILCL
         return_dict=True,
     )
-
-    # MLM auxiliary objective
+    mlm_outputs = None
     if mlm_input_ids is not None:
-        mlm_input_ids = mlm_input_ids.view((-1, mlm_input_ids.size(-1)))
+        mlm_input_ids = mlm_input_ids.view(-1, mlm_input_ids.size(-1))
         mlm_outputs = encoder(
             mlm_input_ids,
             attention_mask=attention_mask,
@@ -308,94 +229,147 @@ def cl_forward(cls,
             output_hidden_states=True,
             return_dict=True,
         )
-
-    # Pooling
+    # Pooling to get sentence embeddings and retrieve hidden states
     pooler_output, hidden_states = cls.pooler(attention_mask, outputs)
-    pooler_output = pooler_output.view((batch_size, num_sent, pooler_output.size(-1)))  # (bs, num_sent, hidden)
-    #     r1, r2 = pooler_output[:,0], pooler_output[:,1]
-    #     r_cos_sim = cls.sim(r1.unsqueeze(1), r2.unsqueeze(0))
-
-    # If using "cls", we add an extra MLP layer
-    # (same as BERT's original implementation) over the representation.
+    # Reshape to [batch_size, num_sent, hidden_size]
+    pooler_output = pooler_output.view(batch_size, num_sent, pooler_output.size(-1))
+    # Apply projection MLP if using 'cls' pooler
     if cls.pooler_type == "cls":
         pooler_output = cls.mlp(pooler_output)
-    #         print(pooler_output.shape)
-    #         pooler_output = pooler_output.view((batch_size*num_sent, pooler_output.size(-1))) # (bs, num_sent, hidden)
-    #         pooler_output = cls.proj_mlp(pooler_output)
-    #         pooler_output = pooler_output.view((batch_size, num_sent, pooler_output.size(-1))) # (bs, num_sent, hidden)
-    #         pooler_output = cls.proj_mlp(pooler_output)
-    # Separate representation
-    z1, z2 = pooler_output[:, 0], pooler_output[:, 1]
-    #     z1 = cls.dropout(z1)
-    #     z2 = cls.dropout(z2)
-    # Hard negative
+    # Separate embeddings for each sentence in the pair (and hard negative if present)
+    z1, z2 = pooler_output[:, 0], pooler_output[:, 1]  # (batch_size, hidden_size) each
     if num_sent == 3:
         z3 = pooler_output[:, 2]
-
-    # Gather all embeddings if using distributed training
+    # Optionally normalize embeddings
+    if cls.normalize_emb:
+        z1 = F.normalize(z1, p=2, dim=-1)
+        z2 = F.normalize(z2, p=2, dim=-1)
+        if num_sent == 3:
+            z3 = F.normalize(z3, p=2, dim=-1)
+    # Gather embeddings from all processes for a larger effective batch (distributed training)
     if dist.is_initialized() and cls.training:
-        # Gather hard negative
-        if num_sent >= 3:
+        # Gather z3 as well if present
+        if num_sent == 3:
             z3_list = [torch.zeros_like(z3) for _ in range(dist.get_world_size())]
             dist.all_gather(tensor_list=z3_list, tensor=z3.contiguous())
-            z3_list[dist.get_rank()] = z3
-            z3 = torch.cat(z3_list, 0)
-
-        # Dummy vectors for allgather
+            z3_list[dist.get_rank()] = z3  # replace the current rank's portion with original (to keep gradient)
+            z3 = torch.cat(z3_list, dim=0)
+        # Gather z1 and z2
         z1_list = [torch.zeros_like(z1) for _ in range(dist.get_world_size())]
         z2_list = [torch.zeros_like(z2) for _ in range(dist.get_world_size())]
-        # Allgather
         dist.all_gather(tensor_list=z1_list, tensor=z1.contiguous())
         dist.all_gather(tensor_list=z2_list, tensor=z2.contiguous())
-
-        # Since allgather results do not have gradients, we replace the
-        # current process's corresponding embeddings with original tensors
         z1_list[dist.get_rank()] = z1
         z2_list[dist.get_rank()] = z2
-        # Get full batch embeddings: (bs x N, hidden)
-        z1 = torch.cat(z1_list, 0)
-        z2 = torch.cat(z2_list, 0)
-
-    cos_sim = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0))
-    # Hard negative
+        # Update z1, z2 to contain embeddings from all processes
+        z1 = torch.cat(z1_list, dim=0)
+        z2 = torch.cat(z2_list, dim=0)
+    # Compute cosine similarity between all z1 and z2 in the batch
+    cos_sim = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0))  # [total_samples, total_samples] similarity matrix
     if num_sent >= 3:
+        # Also compute similarity between z1 and z3 (hard negatives) and append as additional columns
         z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))
-        cos_sim = torch.cat([cos_sim, z1_z3_cos], 1)
-
+        cos_sim = torch.cat([cos_sim, z1_z3_cos], dim=1)
     labels = torch.arange(cos_sim.size(0)).long().to(cls.device)
     loss_fct = nn.CrossEntropyLoss()
 
-    # Calculate loss with hard negatives
+    # Handle hard negative weighting if provided
     if num_sent == 3:
-        # Note that weights are actually logits of weights
         z3_weight = cls.model_args.hard_negative_weight
-        weights = torch.tensor(
-            [[0.0] * (cos_sim.size(-1) - z1_z3_cos.size(-1)) + [0.0] * i + [z3_weight] + [0.0] * (
-                        z1_z3_cos.size(-1) - i - 1) for i in range(z1_z3_cos.size(-1))]
-        ).to(cls.device)
-        cos_sim = cos_sim + weights
+        if z3_weight != 0:
+            # Increase logits for hard negatives on their corresponding positions
+            weights = torch.zeros_like(cos_sim)
+            for i in range(z1_z3_cos.size(0)):
+                # place z3_weight at the hard negative position for each example i
+                weights[i, cos_sim.size(1) - z1_z3_cos.size(1) + i] = z3_weight
+            cos_sim = cos_sim + weights
 
-        # regular loss for simcse
+    # Contrastive loss for sentence-level (SimCSE objective)
     r_loss = loss_fct(cos_sim, labels)
-    #     print('i am hre')
-    #     exit()
-    # loss for construct negatives
     if cls.do_neg:
-        loss = construct_negative(cls, batch_size, attention_mask, z1, cos_sim, loss_fct, hidden_states, num_sent,
-                                  labels)
-
-        # r_loss = loss_fct(r_cos_sim, labels)
-        loss = (loss + r_loss) / 2
-    # Calculate loss for MLM
+        # Include intermediate negatives from specified layers (SSCL)
+        neg_loss = construct_negative(cls, batch_size, attention_mask, z1, cos_sim, loss_fct, hidden_states, num_sent, labels)
+        simcse_loss = 0.5 * (r_loss + neg_loss)
+    else:
+        simcse_loss = r_loss
+    # MLM auxiliary loss (if enabled)
     if mlm_outputs is not None and mlm_labels is not None:
         mlm_labels = mlm_labels.view(-1, mlm_labels.size(-1))
         prediction_scores = cls.lm_head(mlm_outputs.last_hidden_state)
         masked_lm_loss = loss_fct(prediction_scores.view(-1, cls.config.vocab_size), mlm_labels.view(-1))
-        loss = loss + cls.model_args.mlm_weight * masked_lm_loss
+        simcse_loss = simcse_loss + cls.model_args.mlm_weight * masked_lm_loss
 
+    # Inter-layer Contrastive Learning with Semantic Anchors (ILCL-SA)
+    ilcl_loss = 0.0
+    if cls.ilcl_sa:
+        # Prepare anchor embeddings (stop-gradient)
+        anchor_list = [z1.detach(), z2.detach()]
+        if num_sent == 3:
+            anchor_list.append(z3.detach())
+        anchor_stack = torch.cat(anchor_list, dim=0)  # shape: [total_samples, hidden_size]
+        intermediate_losses = []
+        for layer_idx in cls.ilcl_layers:
+            # Get intermediate layer hidden outputs
+            inter_hidden = hidden_states[layer_idx]  # tensor shape [batch*num_sent, seq_len, hid]
+            # Pool the intermediate layer representation
+            if cls.pooler_type == 'cls':
+                inter_pooled = inter_hidden[:, 0]
+            elif cls.pooler_type == 'avg':
+                inter_pooled = (inter_hidden * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
+            else:
+                # default: use average pooling for other pooler types
+                inter_pooled = (inter_hidden * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
+            inter_pooled = inter_pooled.view(batch_size, num_sent, inter_pooled.size(-1))
+            if cls.pooler_type == 'cls':
+                inter_pooled = cls.mlp(inter_pooled)
+            n1, n2 = inter_pooled[:, 0], inter_pooled[:, 1]
+            if num_sent == 3:
+                n3 = inter_pooled[:, 2]
+            # Gather intermediate pooled embeddings across processes if distributed
+            if dist.is_initialized() and cls.training:
+                n1_list = [torch.zeros_like(n1) for _ in range(dist.get_world_size())]
+                n2_list = [torch.zeros_like(n2) for _ in range(dist.get_world_size())]
+                dist.all_gather(tensor_list=n1_list, tensor=n1.contiguous())
+                dist.all_gather(tensor_list=n2_list, tensor=n2.contiguous())
+                n1_list[dist.get_rank()] = n1
+                n2_list[dist.get_rank()] = n2
+                n1 = torch.cat(n1_list, dim=0)
+                n2 = torch.cat(n2_list, dim=0)
+                if num_sent == 3:
+                    n3_list = [torch.zeros_like(n3) for _ in range(dist.get_world_size())]
+                    dist.all_gather(tensor_list=n3_list, tensor=n3.contiguous())
+                    n3_list[dist.get_rank()] = n3
+                    n3 = torch.cat(n3_list, dim=0)
+            # Normalize intermediate embeddings if required
+            if cls.normalize_emb:
+                n1 = F.normalize(n1, p=2, dim=-1)
+                n2 = F.normalize(n2, p=2, dim=-1)
+                if num_sent == 3:
+                    n3 = F.normalize(n3, p=2, dim=-1)
+            # Stack intermediate embeddings similar to anchors
+            inter_list = [n1, n2]
+            if num_sent == 3:
+                inter_list.append(n3)
+            intermediate_stack = torch.cat(inter_list, dim=0)  # [total_samples, hidden_size]
+            # Contrastive loss between anchor_stack and intermediate_stack
+            sim_matrix = cls.sim(anchor_stack.unsqueeze(1), intermediate_stack.unsqueeze(0))
+            ilcl_labels = torch.arange(sim_matrix.size(0)).long().to(cls.device)
+            layer_loss = loss_fct(sim_matrix, ilcl_labels)
+            intermediate_losses.append(layer_loss)
+        ilcl_loss = sum(intermediate_losses) / len(intermediate_losses)
+        # Add ILCL loss (with stop-gradient anchor) to total loss
+        simcse_loss = simcse_loss + cls.ilcl_weight * ilcl_loss
+
+    # Total loss is combination of SimCSE (and SSCL if enabled) + ILCL-SA loss
+    loss = simcse_loss
     if not return_dict:
-        output = (cos_sim,) + outputs[2:]
-        return ((loss,) + output) if loss is not None else output
+        # Return tuple for compatibility
+        output_tuple = (cos_sim,)
+        if outputs.hidden_states is not None or outputs.attentions is not None:
+            # Append hidden_states and attentions if present
+            output_tuple += (outputs.hidden_states,) if outputs.hidden_states is not None else ()
+            output_tuple += (outputs.attentions,) if outputs.attentions is not None else ()
+        return (loss,) + output_tuple
     return SequenceClassifierOutput(
         loss=loss,
         logits=cos_sim,
@@ -403,8 +377,7 @@ def cl_forward(cls,
         attentions=outputs.attentions,
     )
 
-
-def sentemb_forward( cls,
+def sentemb_forward(cls,
     encoder,
     input_ids=None,
     attention_mask=None,
@@ -415,10 +388,8 @@ def sentemb_forward( cls,
     labels=None,
     output_attentions=None,
     output_hidden_states=None,
-    return_dict=None,):
-
+    return_dict=None):
     return_dict = return_dict if return_dict is not None else cls.config.use_return_dict
-
     outputs = encoder(
         input_ids,
         attention_mask=attention_mask,
@@ -430,33 +401,33 @@ def sentemb_forward( cls,
         output_hidden_states=True if cls.pooler_type in ['avg_top2', 'avg_first_last'] else False,
         return_dict=True,
     )
-
-    pooler_output = cls.pooler(attention_mask, outputs)
-    #     print(pooler_output.shape)
+    # Pooler returns (pooled_output, hidden_states)
+    pooled_output, hidden_states = cls.pooler(attention_mask, outputs)
     if cls.pooler_type == "cls" and not cls.model_args.mlp_only_train:
-        pooler_output = cls.mlp(pooler_output)
-
+        pooled_output = cls.mlp(pooled_output)
     if not return_dict:
-        return (outputs[0], pooler_output) + outputs[2:]
-
+        # Convert to tuple output
+        result = (outputs.last_hidden_state, pooled_output)
+        if outputs.hidden_states is not None:
+            result += (outputs.hidden_states,)
+        if outputs.attentions is not None:
+            result += (outputs.attentions,)
+        return result
     return BaseModelOutputWithPoolingAndCrossAttentions(
-        pooler_output=pooler_output,
+        pooler_output=pooled_output,
         last_hidden_state=outputs.last_hidden_state,
         hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
     )
-
 
 class BertForCL(BertPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"position_ids"]
-
     def __init__(self, config, *model_args, **model_kargs):
         super().__init__(config)
         self.model_args = model_kargs["model_args"]
         self.bert = BertModel(config, add_pooling_layer=False)
-
         if self.model_args.do_mlm:
             self.lm_head = BertLMPredictionHead(config)
-
         cl_init(self, config)
 
     def forward(self,
@@ -472,8 +443,7 @@ class BertForCL(BertPreTrainedModel):
         return_dict=None,
         sent_emb=False,
         mlm_input_ids=None,
-        mlm_labels=None,
-    ):
+        mlm_labels=None):
         if sent_emb:
             return sentemb_forward(self, self.bert,
                 input_ids=input_ids,
@@ -482,11 +452,9 @@ class BertForCL(BertPreTrainedModel):
                 position_ids=position_ids,
                 head_mask=head_mask,
                 inputs_embeds=inputs_embeds,
-                labels=labels,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
+                return_dict=return_dict)
         else:
             return cl_forward(self, self.bert,
                 input_ids=input_ids,
@@ -500,22 +468,16 @@ class BertForCL(BertPreTrainedModel):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
                 mlm_input_ids=mlm_input_ids,
-                mlm_labels=mlm_labels,
-            )
-
-
+                mlm_labels=mlm_labels)
 
 class RobertaForCL(RobertaPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"position_ids"]
-
     def __init__(self, config, *model_args, **model_kargs):
         super().__init__(config)
         self.model_args = model_kargs["model_args"]
         self.roberta = RobertaModel(config, add_pooling_layer=False)
-
         if self.model_args.do_mlm:
             self.lm_head = RobertaLMHead(config)
-
         cl_init(self, config)
 
     def forward(self,
@@ -531,8 +493,7 @@ class RobertaForCL(RobertaPreTrainedModel):
         return_dict=None,
         sent_emb=False,
         mlm_input_ids=None,
-        mlm_labels=None,
-    ):
+        mlm_labels=None):
         if sent_emb:
             return sentemb_forward(self, self.roberta,
                 input_ids=input_ids,
@@ -541,14 +502,10 @@ class RobertaForCL(RobertaPreTrainedModel):
                 position_ids=position_ids,
                 head_mask=head_mask,
                 inputs_embeds=inputs_embeds,
-                labels=labels,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
+                return_dict=return_dict)
         else:
-#             print('i am here else')
-#             exit()
             return cl_forward(self, self.roberta,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -561,5 +518,4 @@ class RobertaForCL(RobertaPreTrainedModel):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
                 mlm_input_ids=mlm_input_ids,
-                mlm_labels=mlm_labels,
-            )
+                mlm_labels=mlm_labels)

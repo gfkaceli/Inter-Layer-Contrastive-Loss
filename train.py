@@ -137,6 +137,25 @@ class ModelArguments:
         }
     )
 
+    # ILCL-SA arguments
+    ilcl_sa: bool = field(
+        default=False,
+        metadata={"help": "Enable Inter-layer Contrastive Learning with Semantic Anchors (ILCL-SA)."}
+    )
+    ilcl_layers: List[int] = field(
+        default_factory=list,
+        metadata={"help": "List of intermediate layer indices to use for ILCL-SA (e.g., 3 6 9)."}
+    )
+    ilcl_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight factor for the ILCL-SA loss term."}
+    )
+    normalize_emb: bool = field(
+        default=False,
+        metadata={"help": "Whether to L2-normalize embeddings before computing contrastive losses."}
+    )
+
+
 
 @dataclass
 class DataTrainingArguments:
@@ -602,7 +621,7 @@ def main():
     results = {}
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
-        results = trainer.evaluate(eval_senteval_transfer=True)
+        results = trainer.evaluate(eval_senteval_transfer=training_args.eval_transfer)
 
         output_eval_file = os.path.join(training_args.output_dir, "eval_results.txt")
         if trainer.is_world_process_zero():
