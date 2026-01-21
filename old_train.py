@@ -24,7 +24,7 @@ from transformers import (
 from transformers.tokenization_utils_base import PaddingStrategy, PreTrainedTokenizerBase
 from transformers.trainer_utils import is_main_process
 from transformers.file_utils import cached_property
-from Experiments.old_model import RobertaForCL, BertForCL
+from old_model import RobertaForCL, BertForCL
 from ilclsa.trainers import CLTrainer
 
 logger = logging.getLogger(__name__)
@@ -311,10 +311,10 @@ def main():
     if extension == "txt":
         extension = "text"
     if extension == "csv":
-        datasets = load_dataset(extension, data_files=data_files, cache_dir="../data/",
+        datasets = load_dataset(extension, data_files=data_files, cache_dir="data/",
                                 delimiter="\t" if "tsv" in data_args.train_file else ",")
     else:
-        datasets = load_dataset(extension, data_files=data_files, cache_dir="../data/")
+        datasets = load_dataset(extension, data_files=data_files, cache_dir="data/")
         #return None
 
     # Load pretrained model and tokenizer
