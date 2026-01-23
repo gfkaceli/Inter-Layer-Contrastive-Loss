@@ -139,7 +139,7 @@ class ModelArguments:
 
     # ILCL-SA arguments
     ilcl_sa: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Enable Inter-layer Contrastive Learning with Semantic Anchors (ILCL-SA)."}
     )
     ilcl_layers: List[int] = field(
@@ -151,7 +151,7 @@ class ModelArguments:
         metadata={"help": "Weight factor for the ILCL-SA loss term."}
     )
     normalize_emb: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Whether to L2-normalize embeddings before computing contrastive losses."}
     )
 
