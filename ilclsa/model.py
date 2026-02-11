@@ -5,6 +5,11 @@ import torch.distributed as dist
 
 import transformers
 from torch.nn import MSELoss
+from transformers.models.llama.modeling_llama import (
+LlamaPreTrainedModel,
+LlamaModel,
+LlamaConfig
+)
 from transformers.models.roberta.modeling_roberta import RobertaPreTrainedModel, RobertaModel, RobertaLMHead
 from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertModel, BertLMPredictionHead
 from transformers.activations import gelu
@@ -163,10 +168,25 @@ def cl_init(cls, config):
         else:
             total_layers = None
         if total_layers:
-            # select the last `top_k_layers` indices (excluding final layer)
-            cls.ilcl_layers = [total_layers - i - 2 for i in range(cls.top_k_layers)]
-            # ensure indices are valid and sorted
-            cls.ilcl_layers = sorted([idx for idx in cls.ilcl_layers if idx >= 0])
+            # Select intermediate transformer layers (not the final layer used for anchors)
+            # For a 12-layer model with top_k_layers=3, we want indices like [4, 7, 10]
+            # (transformer layers 4, 7, 10 from hidden_states tuple)
+            # This gives better coverage than just the last few layers
+            if cls.top_k_layers == 1:
+                # Use middle layer
+                cls.ilcl_layers = [total_layers // 2]
+            else:
+                # Evenly distribute across layers, avoiding first 2 and last layer
+                start_layer = 2  # Skip embedding (0) and first transformer layer (1)
+                end_layer = total_layers - 1  # Don't include final layer (that's our anchor)
+                if end_layer > start_layer:
+                    step = (end_layer - start_layer) / (cls.top_k_layers - 1) if cls.top_k_layers > 1 else 1
+                    cls.ilcl_layers = [int(start_layer + step * i) for i in range(cls.top_k_layers)]
+                else:
+                    # Fallback if model is too shallow
+                    cls.ilcl_layers = list(range(1, min(total_layers, cls.top_k_layers + 1)))
+            # Ensure indices are valid and sorted
+            cls.ilcl_layers = sorted([idx for idx in cls.ilcl_layers if 0 < idx < total_layers])
     # (Optional anchor/momentum fields for future)
     cls.use_anchor = getattr(cls.model_args, "use_anchor", False)
     cls.anchor_weight = getattr(cls.model_args, "anchor_weight", 0.2)
@@ -180,6 +200,19 @@ def cl_init(cls, config):
         cls.num_layers = None
     cls.layer_gate = LayerGate(config.hidden_size, cls.num_layers) if cls.num_layers else None
     cls.anchor_loss_fn = MSELoss()
+    # Validate ILCL layer indices
+    if cls.ilcl_sa and cls.ilcl_layers:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"ILCL-SA enabled with layers: {cls.ilcl_layers}")
+        # hidden_states is a tuple: (embedding_layer, layer_1, layer_2, ..., layer_N)
+        # So we need indices in range [0, num_layers] where 0 is embedding, 1-N are transformer layers
+        max_idx = cls.num_layers if cls.num_layers else 12
+        for idx in cls.ilcl_layers:
+            assert 0 <= idx <= max_idx, \
+                f"Invalid ILCL layer index {idx}. Must be in range [0, {max_idx}] for {max_idx}-layer model."
+        logger.info(f"ILCL layer indices validated successfully.")
+
 
 def cl_forward(cls,
     encoder,
@@ -310,6 +343,13 @@ def cl_forward(cls,
         intermediate_losses = []
         for layer_idx in cls.ilcl_layers:
             # Get intermediate layer hidden outputs
+            # Note: hidden_states is a tuple from the transformer:
+            # hidden_states[0] = embedding layer output
+            # hidden_states[1] = transformer layer 1 output
+            # hidden_states[2] = transformer layer 2 output
+            # ...
+            # hidden_states[N] = transformer layer N output (final layer)
+            # layer_idx should be in range [1, N-1] to select intermediate transformer layers
             inter_hidden = hidden_states[layer_idx]  # tensor shape [batch*num_sent, seq_len, hid]
             # Pool the intermediate layer representation
             if cls.pooler_type == 'cls':
@@ -351,10 +391,12 @@ def cl_forward(cls,
             if num_sent == 3:
                 inter_list.append(n3)
             intermediate_stack = torch.cat(inter_list, dim=0)  # [total_samples, hidden_size]
-            # Contrastive loss between anchor_stack and intermediate_stack
-            sim_matrix = cls.sim(anchor_stack.unsqueeze(1), intermediate_stack.unsqueeze(0))
-            ilcl_labels = torch.arange(sim_matrix.size(0)).long().to(cls.device)
-            layer_loss = loss_fct(sim_matrix, ilcl_labels)
+            # Direct pairwise alignment: each anchor aligns with its corresponding intermediate representation
+            # anchor_stack[i] should match intermediate_stack[i] (same input position)
+            # We use cosine similarity divided by temperature, then maximize similarity
+            sim_scores = F.cosine_similarity(anchor_stack, intermediate_stack, dim=-1) / cls.sim.temp
+            # Negative mean to maximize similarity (minimize negative similarity)
+            layer_loss = -sim_scores.mean()
             intermediate_losses.append(layer_loss)
         ilcl_loss = sum(intermediate_losses) / len(intermediate_losses)
         # Add ILCL loss (with stop-gradient anchor) to total loss
@@ -519,3 +561,191 @@ class RobertaForCL(RobertaPreTrainedModel):
                 return_dict=return_dict,
                 mlm_input_ids=mlm_input_ids,
                 mlm_labels=mlm_labels)
+
+
+class LlamaForCL(LlamaPreTrainedModel):
+    """
+    LLaMA model for contrastive learning with ILCL-SA.
+
+    This extends the base LLaMA model with:
+    - Contrastive learning objective (SimCSE-style)
+    - Inter-layer Contrastive Learning with Semantic Anchors (ILCL-SA)
+    - Support for sentence embedding generation
+
+    Key differences from BERT/RoBERTa:
+    - Uses 'avg' or 'last_token' pooling instead of CLS token
+    - No token_type_ids
+    - Decoder architecture with causal attention
+
+    Usage:
+        model = LlamaForCL.from_pretrained(
+            "meta-llama/Llama-2-7b-hf",
+            model_args=model_args
+        )
+    """
+
+    _keys_to_ignore_on_load_missing = [r"lm_head.weight"]
+
+    def __init__(self, config, *model_args, **model_kargs):
+        super().__init__(config)
+        self.model_args = model_kargs["model_args"]
+
+        # LLaMA encoder (decoder-only transformer)
+        self.model = LlamaModel(config)
+
+        # Optional: Language modeling head for auxiliary CLM task
+        # Note: LLaMA is decoder-only, so we use CLM instead of MLM
+        if self.model_args.do_mlm:
+            # For LLaMA, this would actually be CLM (Causal Language Modeling)
+            # We keep the parameter name 'do_mlm' for compatibility
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Initialize ILCL-SA components
+        # This sets up: pooler, MLP, similarity function, ILCL parameters, etc.
+        cl_init(self, config)
+
+        # Gradient checkpointing for memory efficiency (optional)
+        # Uncomment if needed for large models:
+        # self.model.gradient_checkpointing_enable()
+
+    def forward(self,
+                input_ids=None,
+                attention_mask=None,
+                position_ids=None,
+                past_key_values=None,
+                inputs_embeds=None,
+                labels=None,
+                use_cache=None,
+                output_attentions=None,
+                output_hidden_states=None,
+                return_dict=None,
+                sent_emb=False,
+                mlm_input_ids=None,
+                mlm_labels=None,
+                **kwargs):
+        """
+        Forward pass for LLaMA with ILCL-SA.
+
+        Args:
+            input_ids: Token indices of shape [batch_size, seq_length]
+                      or [batch_size, num_sent, seq_length] for contrastive learning
+            attention_mask: Attention mask of same shape as input_ids
+            position_ids: Position indices (optional)
+            sent_emb: If True, return sentence embeddings only (for inference)
+                     If False, compute contrastive loss (for training)
+            mlm_input_ids: Input IDs for auxiliary language modeling task
+            mlm_labels: Labels for auxiliary language modeling task
+
+        Returns:
+            If sent_emb=True: BaseModelOutputWithPoolingAndCrossAttentions with sentence embeddings
+            If sent_emb=False: SequenceClassifierOutput with contrastive loss
+        """
+
+        if sent_emb:
+            # Inference mode: Generate sentence embeddings
+            return sentemb_forward(self, self.model,
+                                   input_ids=input_ids,
+                                   attention_mask=attention_mask,
+                                   position_ids=position_ids,
+                                   inputs_embeds=inputs_embeds,
+                                   output_attentions=output_attentions,
+                                   output_hidden_states=output_hidden_states,
+                                   return_dict=return_dict)
+        else:
+            # Training mode: Contrastive learning with ILCL-SA
+            return cl_forward(self, self.model,
+                              input_ids=input_ids,
+                              attention_mask=attention_mask,
+                              position_ids=position_ids,
+                              inputs_embeds=inputs_embeds,
+                              labels=labels,
+                              output_attentions=output_attentions,
+                              output_hidden_states=output_hidden_states,
+                              return_dict=return_dict,
+                              mlm_input_ids=mlm_input_ids,
+                              mlm_labels=mlm_labels)
+
+    def get_sentence_embedding(self, input_ids, attention_mask=None):
+        """
+        Convenience method to get sentence embeddings.
+
+        Args:
+            input_ids: Token indices [batch_size, seq_length]
+            attention_mask: Attention mask [batch_size, seq_length]
+
+        Returns:
+            Sentence embeddings: [batch_size, hidden_size]
+        """
+        outputs = self.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+            sent_emb=True
+        )
+        return outputs.pooler_output
+
+
+class MistralForCL(LlamaPreTrainedModel):
+    """
+    Mistral model for contrastive learning with ILCL-SA.
+
+    Mistral has the same architecture as LLaMA with some improvements
+    (sliding window attention, grouped-query attention).
+    We can reuse the LLaMA implementation with Mistral's base model.
+    """
+
+    _keys_to_ignore_on_load_missing = [r"lm_head.weight"]
+
+    def __init__(self, config, *model_args, **model_kargs):
+        # Import Mistral model
+        from transformers.models.mistral.modeling_mistral import MistralModel
+
+        super().__init__(config)
+        self.model_args = model_kargs["model_args"]
+
+        # Mistral encoder
+        self.model = MistralModel(config)
+
+        if self.model_args.do_mlm:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        cl_init(self, config)
+
+    def forward(self,
+                input_ids=None,
+                attention_mask=None,
+                position_ids=None,
+                past_key_values=None,
+                inputs_embeds=None,
+                labels=None,
+                use_cache=None,
+                output_attentions=None,
+                output_hidden_states=None,
+                return_dict=None,
+                sent_emb=False,
+                mlm_input_ids=None,
+                mlm_labels=None,
+                **kwargs):
+
+        if sent_emb:
+            return sentemb_forward(self, self.model,
+                                   input_ids=input_ids,
+                                   attention_mask=attention_mask,
+                                   position_ids=position_ids,
+                                   inputs_embeds=inputs_embeds,
+                                   output_attentions=output_attentions,
+                                   output_hidden_states=output_hidden_states,
+                                   return_dict=return_dict)
+        else:
+            return cl_forward(self, self.model,
+                              input_ids=input_ids,
+                              attention_mask=attention_mask,
+                              position_ids=position_ids,
+                              inputs_embeds=inputs_embeds,
+                              labels=labels,
+                              output_attentions=output_attentions,
+                              output_hidden_states=output_hidden_states,
+                              return_dict=return_dict,
+                              mlm_input_ids=mlm_input_ids,
+                              mlm_labels=mlm_labels)
