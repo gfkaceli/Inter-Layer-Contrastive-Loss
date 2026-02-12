@@ -35,12 +35,15 @@ from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy,
 from transformers.trainer_utils import is_main_process
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.file_utils import cached_property, is_torch_available
-from ilclsa.model import RobertaForCL, BertForCL
+from ilclsa.model import RobertaForCL, BertForCL, LlamaForCL
 from ilclsa.trainers import CLTrainer
 
 logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
+os.environ['CURL_CA_BUNDLE'] = ''
+
 
 @dataclass
 class ModelArguments:
@@ -54,7 +57,7 @@ class ModelArguments:
         default=None,
         metadata={
             "help": "The model checkpoint for weights initialization."
-            "Don't set if you want to train a model from scratch."
+                    "Don't set if you want to train a model from scratch."
         },
     )
     model_type: Optional[str] = field(
@@ -83,7 +86,7 @@ class ModelArguments:
         default=False,
         metadata={
             "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
-            "with private models)."
+                    "with private models)."
         },
     )
 
@@ -97,7 +100,8 @@ class ModelArguments:
     pooler_type: str = field(
         default="cls",
         metadata={
-            "help": "What kind of pooler to use (cls, cls_before_pooler, avg, avg_top2, avg_first_last)."
+            "help": "What kind of pooler to use (cls, cls_before_pooler, avg, avg_top2, avg_first_last). "
+                    "For BERT/RoBERTa use 'cls'. For LLaMA/decoder models use 'avg' or 'last_token'."
         }
     )
     hard_negative_layers: int = field(
@@ -156,7 +160,6 @@ class ModelArguments:
     )
 
 
-
 @dataclass
 class DataTrainingArguments:
     """
@@ -189,7 +192,7 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "The training data file (.txt or .csv)."}
     )
-    validation_file : Optional[str] = field(
+    validation_file: Optional[str] = field(
         default=None,
         metadata={"help": "the validation data file (.txt or .csv). "}
     )
@@ -197,14 +200,14 @@ class DataTrainingArguments:
         default=32,
         metadata={
             "help": "The maximum total input sequence length after tokenization. Sequences longer "
-            "than this will be truncated."
+                    "than this will be truncated."
         },
     )
     pad_to_max_length: bool = field(
         default=False,
         metadata={
             "help": "Whether to pad all samples to `max_seq_length`. "
-            "If False, will pad the samples dynamically when batching to the maximum length in the batch."
+                    "If False, will pad the samples dynamically when batching to the maximum length in the batch."
         },
     )
     mlm_probability: float = field(
@@ -234,8 +237,8 @@ class OurTrainingArguments(TrainingArguments):
     )
 
     def __post_init__(self):
-      # ensure TrainingArguments sets up its internals (distributed_state, etc.)
-      super().__post_init__()
+        # ensure TrainingArguments sets up its internals (distributed_state, etc.)
+        super().__post_init__()
 
     @cached_property
     def _setup_devices(self) -> "torch.device":
@@ -281,8 +284,8 @@ class OurTrainingArguments(TrainingArguments):
 
         return device
 
-def main():
 
+def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, OurTrainingArguments))
 
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -345,7 +348,7 @@ def main():
                                 delimiter="\t" if "tsv" in data_args.train_file else ",")
     else:
         datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/")
-        #return None
+        # return None
 
     # Load pretrained model and tokenizer
     #
@@ -371,15 +374,66 @@ def main():
         "revision": model_args.model_revision,
         "use_auth_token": True if model_args.use_auth_token else None,
     }
+
+    # For decoder-only models (LLaMA, Mistral, etc.), set left padding
+    model_type = getattr(model_args, 'model_type', '')
+    model_type = str(model_type)
+    if model_type.lower() in ['llama', 'mistral', 'gemma', 'qwen', 'gpt2']:
+        tokenizer_kwargs['padding_side'] = 'left'
+        logger.info(f"Setting padding_side='left' for decoder model: {model_type}")
+
+    # Load tokenizer with fallback for tiktoken issues
     if model_args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
+            logger.info("✓ Tokenizer loaded successfully")
+        except ValueError as e:
+            if "tiktoken" in str(e):
+                logger.warning(
+                    "Failed to load fast tokenizer due to missing tiktoken. "
+                    "Falling back to slow tokenizer. Install with: pip install tiktoken"
+                )
+                tokenizer_kwargs['use_fast'] = False
+                tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
+                logger.info("✓ Slow tokenizer loaded successfully")
+            else:
+                raise
     elif model_args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
+            logger.info("✓ Tokenizer loaded successfully")
+        except ValueError as e:
+            if "tiktoken" in str(e):
+                logger.warning(
+                    "Failed to load fast tokenizer due to missing tiktoken. "
+                    "Falling back to slow tokenizer. Install with: pip install tiktoken"
+                )
+                tokenizer_kwargs['use_fast'] = False
+                tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
+                logger.info("✓ Slow tokenizer loaded successfully")
+            else:
+                raise
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+
+    # Handle models without padding token (like LLaMA, GPT-2, etc.)
+    if tokenizer.pad_token is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+            logger.info(f"✓ Set pad_token to eos_token: '{tokenizer.pad_token}' (id: {tokenizer.pad_token_id})")
+        elif tokenizer.bos_token is not None:
+            tokenizer.pad_token = tokenizer.bos_token
+            tokenizer.pad_token_id = tokenizer.bos_token_id
+            logger.info(f"✓ Set pad_token to bos_token: '{tokenizer.pad_token}' (id: {tokenizer.pad_token_id})")
+        else:
+            logger.warning("No EOS or BOS token found. Adding new PAD token.")
+            special_tokens_dict = {'pad_token': '[PAD]'}
+            num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
+            logger.info(f"Added {num_added_toks} special tokens")
 
     if model_args.model_name_or_path:
         if 'roberta' in model_args.model_name_or_path:
@@ -416,8 +470,24 @@ def main():
             if model_args.do_mlm:
                 pretrained_model = BertForPreTraining.from_pretrained(model_args.model_name_or_path)
                 model.lm_head.load_state_dict(pretrained_model.cls.predictions.state_dict())
+        elif 'llama' in model_args.model_name_or_path.lower() or model_type == 'llama':
+            logger.info("Loading LLaMA model for contrastive learning with ILCL-SA")
+            model = LlamaForCL.from_pretrained(
+                model_args.model_name_or_path,
+                config=config,
+                cache_dir=model_args.cache_dir,
+                revision=model_args.model_revision,
+                use_auth_token=True if model_args.use_auth_token else None,
+                model_args=model_args,
+                torch_dtype=torch.float16 if training_args.fp16 else torch.float32,
+            )
+            logger.info("✓ LLaMA model loaded successfully")
+            # Enable gradient checkpointing for memory efficiency (optional)
+            if hasattr(model, 'gradient_checkpointing_enable'):
+                model.gradient_checkpointing_enable()
+                logger.info("✓ Gradient checkpointing enabled for memory efficiency")
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Model type not supported: {model_args.model_name_or_path}")
     else:
         raise NotImplementedError
         logger.info("Training new model from scratch")
